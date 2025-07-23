@@ -1,4 +1,5 @@
 import { pgTable, text, serial, integer, timestamp, real } from "drizzle-orm/pg-core";
+import { relations } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -23,6 +24,25 @@ export const connections = pgTable("connections", {
   lastMeeting: timestamp("last_meeting").defaultNow(),
   createdAt: timestamp("created_at").defaultNow(),
 });
+
+// Relations
+export const peopleRelations = relations(people, ({ many }) => ({
+  connectionsFrom: many(connections, { relationName: "fromPerson" }),
+  connectionsTo: many(connections, { relationName: "toPerson" }),
+}));
+
+export const connectionsRelations = relations(connections, ({ one }) => ({
+  fromPerson: one(people, {
+    fields: [connections.fromPersonId],
+    references: [people.id],
+    relationName: "fromPerson",
+  }),
+  toPerson: one(people, {
+    fields: [connections.toPersonId],
+    references: [people.id],
+    relationName: "toPerson",
+  }),
+}));
 
 export const insertPersonSchema = createInsertSchema(people).omit({
   id: true,

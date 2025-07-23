@@ -1,4 +1,6 @@
 import { people, connections, type Person, type InsertPerson, type Connection, type InsertConnection, type NetworkStats } from "@shared/schema";
+import { db } from "./db";
+import { eq, sql, ilike, and, or } from "drizzle-orm";
 
 export interface IStorage {
   // Person operations
@@ -222,4 +224,170 @@ export class MemStorage implements IStorage {
   }
 }
 
-export const storage = new MemStorage();
+export class DatabaseStorage implements IStorage {
+  constructor() {
+    this.initializeDefaultData();
+  }
+
+  private async initializeDefaultData() {
+    try {
+      const existingPeople = await this.getAllPeople();
+      if (existingPeople.length === 0) {
+        await this.createPerson({
+          name: "自分",
+          location: "Tokyo",
+          initials: "自分"
+        });
+      }
+    } catch (error) {
+      console.log("Database initialization skipped:", error);
+    }
+  }
+  // Person operations
+  async getPerson(id: number): Promise<Person | undefined> {
+    const [person] = await db.select().from(people).where(eq(people.id, id));
+    return person || undefined;
+  }
+
+  async getPersonByName(name: string): Promise<Person | undefined> {
+    const [person] = await db.select().from(people).where(eq(people.name, name));
+    return person || undefined;
+  }
+
+  async createPerson(insertPerson: InsertPerson): Promise<Person> {
+    const [person] = await db
+      .insert(people)
+      .values(insertPerson)
+      .returning();
+    return person;
+  }
+
+  async getAllPeople(): Promise<Person[]> {
+    return await db.select().from(people);
+  }
+
+  async getPeopleByLocation(location: string): Promise<Person[]> {
+    return await db.select().from(people).where(eq(people.location, location));
+  }
+
+  async updatePersonStats(id: number, averageRating: number, connectionCount: number): Promise<void> {
+    await db
+      .update(people)
+      .set({ averageRating, connectionCount })
+      .where(eq(people.id, id));
+  }
+
+  // Connection operations
+  async getConnection(id: number): Promise<Connection | undefined> {
+    const [connection] = await db.select().from(connections).where(eq(connections.id, id));
+    return connection || undefined;
+  }
+
+  async createConnection(insertConnection: InsertConnection): Promise<Connection> {
+    const [connection] = await db
+      .insert(connections)
+      .values(insertConnection)
+      .returning();
+
+    // Update stats for both people
+    await this.recalculatePersonStats(insertConnection.fromPersonId);
+    await this.recalculatePersonStats(insertConnection.toPersonId);
+
+    return connection;
+  }
+
+  async getConnectionsForPerson(personId: number): Promise<Connection[]> {
+    return await db
+      .select()
+      .from(connections)
+      .where(or(
+        eq(connections.fromPersonId, personId),
+        eq(connections.toPersonId, personId)
+      ));
+  }
+
+  async getAllConnections(): Promise<Connection[]> {
+    return await db.select().from(connections);
+  }
+
+  async getConnectionsBetween(person1Id: number, person2Id: number): Promise<Connection[]> {
+    return await db
+      .select()
+      .from(connections)
+      .where(
+        or(
+          and(eq(connections.fromPersonId, person1Id), eq(connections.toPersonId, person2Id)),
+          and(eq(connections.fromPersonId, person2Id), eq(connections.toPersonId, person1Id))
+        )
+      );
+  }
+
+  async updateMeetingCount(fromPersonId: number, toPersonId: number): Promise<void> {
+    const existingConnections = await this.getConnectionsBetween(fromPersonId, toPersonId);
+    
+    if (existingConnections.length > 0) {
+      const connection = existingConnections[0];
+      await db
+        .update(connections)
+        .set({ 
+          meetingCount: (connection.meetingCount || 0) + 1,
+          lastMeeting: new Date()
+        })
+        .where(eq(connections.id, connection.id));
+    }
+  }
+
+  // Analytics
+  async getNetworkStats(): Promise<NetworkStats> {
+    const [peopleCount] = await db.select({ count: sql<number>`count(*)` }).from(people);
+    const [connectionsCount] = await db.select({ count: sql<number>`count(*)` }).from(connections);
+    
+    const [avgTrust] = await db.select({ 
+      avg: sql<number>`coalesce(avg(${connections.trustRating}), 0)` 
+    }).from(connections);
+    
+    const locationsResult = await db.select({ location: people.location }).from(people);
+    const uniqueLocations = new Set(locationsResult.map(r => r.location));
+    
+    const averageTrust = Number(avgTrust.avg) || 0;
+    
+    return {
+      totalPeople: Number(peopleCount.count),
+      totalConnections: Number(connectionsCount.count),
+      averageTrust: Math.round(averageTrust * 10) / 10,
+      activeCommunities: uniqueLocations.size,
+      trustDistribution: averageTrust / 5 * 100,
+    };
+  }
+
+  async getLocations(): Promise<string[]> {
+    const locationsResult = await db.select({ location: people.location }).from(people);
+    const uniqueLocations = new Set(locationsResult.map(r => r.location));
+    return Array.from(uniqueLocations);
+  }
+
+  async searchPeople(query: string): Promise<Person[]> {
+    return await db
+      .select()
+      .from(people)
+      .where(
+        or(
+          ilike(people.name, `%${query}%`),
+          ilike(people.location, `%${query}%`)
+        )
+      );
+  }
+
+  private async recalculatePersonStats(personId: number): Promise<void> {
+    const personConnections = await this.getConnectionsForPerson(personId);
+    const connectionCount = personConnections.length;
+    
+    const averageRating = personConnections.length > 0
+      ? personConnections.reduce((sum, conn) => sum + conn.trustRating, 0) / personConnections.length
+      : 0;
+    
+    await this.updatePersonStats(personId, averageRating, connectionCount);
+  }
+}
+
+export const storage = new DatabaseStorage();

@@ -24,11 +24,12 @@ Preferred communication style: Simple, everyday language.
 - **Development**: Hot reloading with Vite integration in development mode
 
 ### Data Storage
-- **Database**: PostgreSQL (configured via DATABASE_URL environment variable)
-- **ORM**: Drizzle ORM with schema-first approach
+- **Database**: Neon PostgreSQL 16.9 (production-ready with auto-scaling)
+- **ORM**: Drizzle ORM with schema-first approach and optimized queries
 - **Migrations**: Drizzle Kit for database migrations and schema management
-- **Connection**: Neon Database serverless driver for PostgreSQL connectivity
-- **Fallback**: In-memory storage implementation for development/testing
+- **Connection**: Neon Database serverless driver with connection pooling
+- **Production Features**: Health checks, performance monitoring, automatic indexing
+- **Security**: Secure connections, environment variable configuration
 
 ## Key Components
 

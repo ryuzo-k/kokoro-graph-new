@@ -1,6 +1,7 @@
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
+import { initializeProductionMode, ProductionDatabaseConfig } from "./production-config";
 
 const app = express();
 app.use(express.json());
@@ -37,6 +38,17 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Initialize production optimizations
+  initializeProductionMode();
+  
+  // Database health check on startup
+  const isHealthy = await ProductionDatabaseConfig.healthCheck();
+  if (!isHealthy) {
+    console.error("❌ Database connection failed on startup");
+    process.exit(1);
+  }
+  console.log("✅ Database connection verified");
+
   const server = await registerRoutes(app);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {

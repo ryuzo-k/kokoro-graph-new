@@ -1,0 +1,594 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// server/index.ts
+import express2 from "express";
+
+// server/routes.ts
+import { createServer } from "http";
+
+// shared/schema.ts
+var schema_exports = {};
+__export(schema_exports, {
+  connections: () => connections,
+  connectionsRelations: () => connectionsRelations,
+  insertConnectionSchema: () => insertConnectionSchema,
+  insertPersonSchema: () => insertPersonSchema,
+  people: () => people,
+  peopleRelations: () => peopleRelations
+});
+import { pgTable, text, serial, integer, timestamp, real } from "drizzle-orm/pg-core";
+import { relations } from "drizzle-orm";
+import { createInsertSchema } from "drizzle-zod";
+var people = pgTable("people", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  location: text("location").notNull(),
+  initials: text("initials").notNull(),
+  averageRating: real("average_rating").default(0),
+  connectionCount: integer("connection_count").default(0),
+  createdAt: timestamp("created_at").defaultNow()
+});
+var connections = pgTable("connections", {
+  id: serial("id").primaryKey(),
+  fromPersonId: integer("from_person_id").notNull(),
+  toPersonId: integer("to_person_id").notNull(),
+  trustRating: integer("trust_rating").notNull(),
+  location: text("location").notNull(),
+  notes: text("notes"),
+  meetingCount: integer("meeting_count").default(1),
+  lastMeeting: timestamp("last_meeting").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow()
+});
+var peopleRelations = relations(people, ({ many }) => ({
+  connectionsFrom: many(connections, { relationName: "fromPerson" }),
+  connectionsTo: many(connections, { relationName: "toPerson" })
+}));
+var connectionsRelations = relations(connections, ({ one }) => ({
+  fromPerson: one(people, {
+    fields: [connections.fromPersonId],
+    references: [people.id],
+    relationName: "fromPerson"
+  }),
+  toPerson: one(people, {
+    fields: [connections.toPersonId],
+    references: [people.id],
+    relationName: "toPerson"
+  })
+}));
+var insertPersonSchema = createInsertSchema(people).omit({
+  id: true,
+  averageRating: true,
+  connectionCount: true,
+  createdAt: true
+});
+var insertConnectionSchema = createInsertSchema(connections).omit({
+  id: true,
+  meetingCount: true,
+  lastMeeting: true,
+  createdAt: true
+});
+
+// server/db.ts
+import { Pool, neonConfig } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-serverless";
+import ws from "ws";
+neonConfig.webSocketConstructor = ws;
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?"
+  );
+}
+var pool = new Pool({ connectionString: process.env.DATABASE_URL });
+var db = drizzle({ client: pool, schema: schema_exports });
+
+// server/storage.ts
+import { eq, sql, ilike, and, or } from "drizzle-orm";
+var DatabaseStorage = class {
+  constructor() {
+    this.initializeDefaultData();
+  }
+  async initializeDefaultData() {
+    try {
+      const existingPeople = await this.getAllPeople();
+      if (existingPeople.length === 0) {
+        await this.createPerson({
+          name: "\u81EA\u5206",
+          location: "Tokyo",
+          initials: "\u81EA\u5206"
+        });
+      }
+    } catch (error) {
+      console.log("Database initialization skipped:", error);
+    }
+  }
+  // Person operations
+  async getPerson(id) {
+    const [person] = await db.select().from(people).where(eq(people.id, id));
+    return person || void 0;
+  }
+  async getPersonByName(name) {
+    const [person] = await db.select().from(people).where(eq(people.name, name));
+    return person || void 0;
+  }
+  async createPerson(insertPerson) {
+    const [person] = await db.insert(people).values(insertPerson).returning();
+    return person;
+  }
+  async getAllPeople() {
+    return await db.select().from(people);
+  }
+  async getPeopleByLocation(location) {
+    return await db.select().from(people).where(eq(people.location, location));
+  }
+  async updatePersonStats(id, averageRating, connectionCount) {
+    await db.update(people).set({ averageRating, connectionCount }).where(eq(people.id, id));
+  }
+  // Connection operations
+  async getConnection(id) {
+    const [connection] = await db.select().from(connections).where(eq(connections.id, id));
+    return connection || void 0;
+  }
+  async createConnection(insertConnection) {
+    const [connection] = await db.insert(connections).values(insertConnection).returning();
+    await this.recalculatePersonStats(insertConnection.fromPersonId);
+    await this.recalculatePersonStats(insertConnection.toPersonId);
+    return connection;
+  }
+  async getConnectionsForPerson(personId) {
+    return await db.select().from(connections).where(or(
+      eq(connections.fromPersonId, personId),
+      eq(connections.toPersonId, personId)
+    ));
+  }
+  async getAllConnections() {
+    return await db.select().from(connections);
+  }
+  async getConnectionsBetween(person1Id, person2Id) {
+    return await db.select().from(connections).where(
+      or(
+        and(eq(connections.fromPersonId, person1Id), eq(connections.toPersonId, person2Id)),
+        and(eq(connections.fromPersonId, person2Id), eq(connections.toPersonId, person1Id))
+      )
+    );
+  }
+  async updateMeetingCount(fromPersonId, toPersonId) {
+    const existingConnections = await this.getConnectionsBetween(fromPersonId, toPersonId);
+    if (existingConnections.length > 0) {
+      const connection = existingConnections[0];
+      await db.update(connections).set({
+        meetingCount: (connection.meetingCount || 0) + 1,
+        lastMeeting: /* @__PURE__ */ new Date()
+      }).where(eq(connections.id, connection.id));
+    }
+  }
+  // Analytics
+  async getNetworkStats() {
+    const [peopleCount] = await db.select({ count: sql`count(*)` }).from(people);
+    const [connectionsCount] = await db.select({ count: sql`count(*)` }).from(connections);
+    const [avgTrust] = await db.select({
+      avg: sql`coalesce(avg(${connections.trustRating}), 0)`
+    }).from(connections);
+    const locationsResult = await db.select({ location: people.location }).from(people);
+    const uniqueLocations = new Set(locationsResult.map((r) => r.location));
+    const averageTrust = Number(avgTrust.avg) || 0;
+    return {
+      totalPeople: Number(peopleCount.count),
+      totalConnections: Number(connectionsCount.count),
+      averageTrust: Math.round(averageTrust * 10) / 10,
+      activeCommunities: uniqueLocations.size,
+      trustDistribution: averageTrust / 5 * 100
+    };
+  }
+  async getLocations() {
+    const locationsResult = await db.select({ location: people.location }).from(people);
+    const uniqueLocations = new Set(locationsResult.map((r) => r.location));
+    return Array.from(uniqueLocations);
+  }
+  async searchPeople(query) {
+    return await db.select().from(people).where(
+      or(
+        ilike(people.name, `%${query}%`),
+        ilike(people.location, `%${query}%`)
+      )
+    );
+  }
+  async recalculatePersonStats(personId) {
+    const personConnections = await this.getConnectionsForPerson(personId);
+    const connectionCount = personConnections.length;
+    const averageRating = personConnections.length > 0 ? personConnections.reduce((sum, conn) => sum + conn.trustRating, 0) / personConnections.length : 0;
+    await this.updatePersonStats(personId, averageRating, connectionCount);
+  }
+};
+var storage = new DatabaseStorage();
+
+// server/routes.ts
+import { z } from "zod";
+async function registerRoutes(app2) {
+  app2.get("/api/people", async (req, res) => {
+    try {
+      const location = req.query.location;
+      const people2 = location ? await storage.getPeopleByLocation(location) : await storage.getAllPeople();
+      res.json(people2);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch people" });
+    }
+  });
+  app2.get("/api/people/:id", async (req, res) => {
+    try {
+      const id = parseInt(req.params.id);
+      const person = await storage.getPerson(id);
+      if (!person) {
+        return res.status(404).json({ error: "Person not found" });
+      }
+      res.json(person);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch person" });
+    }
+  });
+  app2.post("/api/people", async (req, res) => {
+    try {
+      const validatedData = insertPersonSchema.parse(req.body);
+      const existing = await storage.getPersonByName(validatedData.name);
+      if (existing) {
+        return res.json(existing);
+      }
+      const initials = validatedData.name.split(" ").map((part) => part.charAt(0)).join("").toUpperCase().substring(0, 2);
+      const person = await storage.createPerson({
+        ...validatedData,
+        initials
+      });
+      res.status(201).json(person);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ error: "Invalid data", details: error.errors });
+      } else {
+        res.status(500).json({ error: "Failed to create person" });
+      }
+    }
+  });
+  app2.get("/api/people/search/:query", async (req, res) => {
+    try {
+      const query = req.params.query;
+      const people2 = await storage.searchPeople(query);
+      res.json(people2);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to search people" });
+    }
+  });
+  app2.get("/api/connections", async (req, res) => {
+    try {
+      const connections2 = await storage.getAllConnections();
+      res.json(connections2);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch connections" });
+    }
+  });
+  app2.get("/api/people/:id/connections", async (req, res) => {
+    try {
+      const personId = parseInt(req.params.id);
+      const connections2 = await storage.getConnectionsForPerson(personId);
+      res.json(connections2);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch connections" });
+    }
+  });
+  app2.post("/api/connections", async (req, res) => {
+    try {
+      const validatedData = insertConnectionSchema.parse(req.body);
+      const fromPerson = await storage.getPerson(validatedData.fromPersonId);
+      const toPerson = await storage.getPerson(validatedData.toPersonId);
+      if (!fromPerson || !toPerson) {
+        return res.status(400).json({ error: "One or both people do not exist" });
+      }
+      const connection = await storage.createConnection(validatedData);
+      res.status(201).json(connection);
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        res.status(400).json({ error: "Invalid data", details: error.errors });
+      } else {
+        res.status(500).json({ error: "Failed to create connection" });
+      }
+    }
+  });
+  app2.get("/api/stats", async (req, res) => {
+    try {
+      const stats = await storage.getNetworkStats();
+      res.json(stats);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch stats" });
+    }
+  });
+  app2.get("/api/locations", async (req, res) => {
+    try {
+      const locations = await storage.getLocations();
+      res.json(locations);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch locations" });
+    }
+  });
+  app2.post("/api/quick-entry", async (req, res) => {
+    try {
+      const { contactName, location, trustRating, notes } = req.body;
+      if (!contactName || !location || !trustRating) {
+        return res.status(400).json({ error: "Missing required fields" });
+      }
+      let contactPerson = await storage.getPersonByName(contactName);
+      if (!contactPerson) {
+        const initials = contactName.split(" ").map((part) => part.charAt(0)).join("").toUpperCase().substring(0, 2);
+        contactPerson = await storage.createPerson({
+          name: contactName,
+          location,
+          initials
+        });
+      }
+      const currentUser = await storage.getPerson(1);
+      if (!currentUser) {
+        return res.status(500).json({ error: "Current user not found" });
+      }
+      const connection = await storage.createConnection({
+        fromPersonId: currentUser.id,
+        toPersonId: contactPerson.id,
+        trustRating: parseInt(trustRating),
+        location,
+        notes: notes || null
+      });
+      res.status(201).json({ person: contactPerson, connection });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to process quick entry" });
+    }
+  });
+  const httpServer = createServer(app2);
+  return httpServer;
+}
+
+// server/vite.ts
+import express from "express";
+import fs from "fs";
+import path2 from "path";
+import { createServer as createViteServer, createLogger } from "vite";
+
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+var vite_config_default = defineConfig({
+  plugins: [
+    react(),
+    runtimeErrorOverlay(),
+    ...process.env.NODE_ENV !== "production" && process.env.REPL_ID !== void 0 ? [
+      await import("@replit/vite-plugin-cartographer").then(
+        (m) => m.cartographer()
+      )
+    ] : []
+  ],
+  resolve: {
+    alias: {
+      "@": path.resolve(import.meta.dirname, "client", "src"),
+      "@shared": path.resolve(import.meta.dirname, "shared"),
+      "@assets": path.resolve(import.meta.dirname, "attached_assets")
+    }
+  },
+  root: path.resolve(import.meta.dirname, "client"),
+  build: {
+    outDir: path.resolve(import.meta.dirname, "dist/public"),
+    emptyOutDir: true
+  },
+  server: {
+    fs: {
+      strict: true,
+      deny: ["**/.*"]
+    }
+  }
+});
+
+// server/vite.ts
+import { nanoid } from "nanoid";
+var viteLogger = createLogger();
+function log(message, source = "express") {
+  const formattedTime = (/* @__PURE__ */ new Date()).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true
+  });
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+async function setupVite(app2, server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true
+  };
+  const vite = await createViteServer({
+    ...vite_config_default,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      }
+    },
+    server: serverOptions,
+    appType: "custom"
+  });
+  app2.use(vite.middlewares);
+  app2.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+    try {
+      const clientTemplate = path2.resolve(
+        import.meta.dirname,
+        "..",
+        "client",
+        "index.html"
+      );
+      let template = await fs.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e);
+      next(e);
+    }
+  });
+}
+function serveStatic(app2) {
+  const distPath = path2.resolve(import.meta.dirname, "public");
+  if (!fs.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`
+    );
+  }
+  app2.use(express.static(distPath));
+  app2.use("*", (_req, res) => {
+    res.sendFile(path2.resolve(distPath, "index.html"));
+  });
+}
+
+// server/production-config.ts
+import { sql as sql2 } from "drizzle-orm";
+var ProductionDatabaseConfig = class {
+  // Database health check
+  static async healthCheck() {
+    try {
+      await db.execute(sql2`SELECT 1`);
+      return true;
+    } catch (error) {
+      console.error("Database health check failed:", error);
+      return false;
+    }
+  }
+  // Performance monitoring
+  static async getPerformanceStats() {
+    try {
+      const tableStats = await db.execute(sql2`
+        SELECT 
+          schemaname,
+          tablename,
+          n_tup_ins as inserts,
+          n_tup_upd as updates,
+          n_tup_del as deletes,
+          n_live_tup as live_rows,
+          n_dead_tup as dead_rows
+        FROM pg_stat_user_tables 
+        WHERE tablename IN ('people', 'connections')
+      `);
+      return tableStats;
+    } catch (error) {
+      console.error("Failed to get performance stats:", error);
+      return null;
+    }
+  }
+  // Database cleanup (remove old data if needed)
+  static async cleanupOldData(daysOld = 365) {
+    try {
+      const cutoffDate = /* @__PURE__ */ new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+      console.log(`Cleanup would remove data older than ${cutoffDate.toISOString()}`);
+      return { success: true, message: "Cleanup completed" };
+    } catch (error) {
+      console.error("Cleanup failed:", error);
+      return { success: false, message: "Cleanup failed" };
+    }
+  }
+  // Connection pool monitoring
+  static async getConnectionInfo() {
+    try {
+      const result = await db.execute(sql2`
+        SELECT 
+          count(*) as total_connections,
+          count(*) FILTER (WHERE state = 'active') as active_connections,
+          count(*) FILTER (WHERE state = 'idle') as idle_connections
+        FROM pg_stat_activity 
+        WHERE datname = current_database()
+      `);
+      return result;
+    } catch (error) {
+      console.error("Failed to get connection info:", error);
+      return null;
+    }
+  }
+};
+function initializeProductionMode() {
+  if (process.env.NODE_ENV === "production") {
+    console.log("\u{1F680} Production mode initialized");
+    setInterval(async () => {
+      const isHealthy = await ProductionDatabaseConfig.healthCheck();
+      if (!isHealthy) {
+        console.error("\u26A0\uFE0F Database health check failed");
+      }
+    }, 3e5);
+    setInterval(async () => {
+      const stats = await ProductionDatabaseConfig.getPerformanceStats();
+      if (stats) {
+        console.log("\u{1F4CA} Database performance stats:", stats);
+      }
+    }, 9e5);
+  }
+}
+
+// server/index.ts
+var app = express2();
+app.use(express2.json());
+app.use(express2.urlencoded({ extended: false }));
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path3 = req.path;
+  let capturedJsonResponse = void 0;
+  const originalResJson = res.json;
+  res.json = function(bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path3.startsWith("/api")) {
+      let logLine = `${req.method} ${path3} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "\u2026";
+      }
+      log(logLine);
+    }
+  });
+  next();
+});
+(async () => {
+  initializeProductionMode();
+  const isHealthy = await ProductionDatabaseConfig.healthCheck();
+  if (!isHealthy) {
+    console.error("\u274C Database connection failed on startup");
+    process.exit(1);
+  }
+  console.log("\u2705 Database connection verified");
+  const server = await registerRoutes(app);
+  app.use((err, _req, res, _next) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    res.status(status).json({ message });
+    throw err;
+  });
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+  const port = parseInt(process.env.PORT || "5000", 10);
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();
